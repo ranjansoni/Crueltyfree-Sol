@@ -4,6 +4,14 @@ import { basename } from "node:path";
 const ASSESSMENT_STATUSES = ["verified", "certified", "brand_claimed", "conflicting", "unverified", "no", "unknown"];
 const SOURCE_TYPES = ["certification", "brand_policy", "retailer_page", "third_party_database", "email", "packaging", "manual_review", "other"];
 const AVAILABILITY_STATUSES = ["in_stock", "out_of_stock", "online_only", "in_store_only", "limited", "unknown"];
+const SOURCE_TYPE_ALIASES = {
+  certification_directory: "certification",
+  product_page: "retailer_page",
+};
+const AVAILABILITY_ALIASES = {
+  available: "in_stock",
+  unavailable: "out_of_stock",
+};
 const REQUIRED_FIELDS = [
   "brand_name",
   "product_name",
@@ -15,8 +23,6 @@ const REQUIRED_FIELDS = [
   "product_evidence_source_type",
   "country",
   "currency",
-  "expected_price",
-  "retailer_name",
 ];
 
 function normalizeName(value = "") {
@@ -75,13 +81,21 @@ function validateRow(raw, rowNumber) {
   const currency = raw.currency?.trim().toUpperCase();
   const brandStatus = raw.brand_cruelty_free_status?.trim();
   const productStatus = raw.product_vegan_status?.trim();
-  const brandSourceType = raw.brand_evidence_source_type?.trim();
-  const productSourceType = raw.product_evidence_source_type?.trim();
-  const availabilityStatus = raw.availability_status?.trim() || "unknown";
-  const price = Number.parseFloat((raw.expected_price ?? "").replace(/[$,]/g, ""));
+  const brandSourceTypeRaw = raw.brand_evidence_source_type?.trim();
+  const productSourceTypeRaw = raw.product_evidence_source_type?.trim();
+  const brandSourceType = SOURCE_TYPE_ALIASES[brandSourceTypeRaw] ?? brandSourceTypeRaw;
+  const productSourceType = SOURCE_TYPE_ALIASES[productSourceTypeRaw] ?? productSourceTypeRaw;
+  const availabilityRaw = raw.availability_status?.trim() || "unknown";
+  const availabilityStatus = AVAILABILITY_ALIASES[availabilityRaw] ?? availabilityRaw;
+  const hasExpectedPrice = !!raw.expected_price?.trim();
+  const hasRetailerName = !!raw.retailer_name?.trim();
+  const retailerName = hasRetailerName ? raw.retailer_name : "Unknown retailer";
+  const price = hasExpectedPrice ? Number.parseFloat((raw.expected_price ?? "").replace(/[$,]/g, "")) : 0;
 
   if (country !== "CA" && country !== "US") messages.push({ level: "error", field: "country", message: "Country must be CA or US." });
   if (currency !== "CAD" && currency !== "USD") messages.push({ level: "error", field: "currency", message: "Currency must be CAD or USD." });
+  if (!hasExpectedPrice) messages.push({ level: "warning", field: "expected_price", message: "Missing price; product will be imported inactive for admin review." });
+  if (!hasRetailerName) messages.push({ level: "warning", field: "retailer_name", message: "Missing retailer; product will be imported inactive for admin review." });
   if (!Number.isFinite(price) || price < 0) messages.push({ level: "error", field: "expected_price", message: "Expected price must be a positive number." });
   if (!ASSESSMENT_STATUSES.includes(brandStatus)) messages.push({ level: "error", field: "brand_cruelty_free_status", message: "Invalid brand status." });
   if (!ASSESSMENT_STATUSES.includes(productStatus)) messages.push({ level: "error", field: "product_vegan_status", message: "Invalid vegan status." });
@@ -101,12 +115,17 @@ function validateRow(raw, rowNumber) {
       ...raw,
       country,
       currency,
+      brand_evidence_source_type: brandSourceType,
+      product_evidence_source_type: productSourceType,
       availability_status: availabilityStatus,
       normalized_brand_name: normalizedBrandName,
       normalized_product_name: normalizedProductName,
-      normalized_retailer_name: normalizeName(raw.retailer_name),
+      retailer_name: retailerName,
+      normalized_retailer_name: normalizeName(retailerName),
       product_id: [normalizedBrandName, normalizedProductName].filter(Boolean).join("-"),
       expected_price_number: price,
+      has_expected_price: hasExpectedPrice,
+      is_public_ready: hasExpectedPrice && hasRetailerName,
       tag_list: (raw.tags ?? "").split("|").map((tag) => tag.trim()).filter(Boolean),
     },
   };
@@ -169,7 +188,7 @@ brand_upsert as (
 ),
 product_upsert as (
   insert into public.products(id, brand_id, brand, name, normalized_name, category, subcategory, description, upc, sku, tags, badges, certifications, colour, accent, review_status, is_active)
-  select ${sqlString(r.product_id)}, brand_upsert.id, ${sqlString(r.brand_name)}, ${sqlString(r.product_name)}, ${sqlString(r.normalized_product_name)}, ${sqlString(r.category)}, ${sqlString(r.subcategory)}, ${sqlString(r.description)}, ${sqlString(r.upc)}, ${sqlString(r.sku)}, ${sqlTextArray(r.tag_list)}, array['Imported']::text[], '{}'::text[], '#dcead7', '#416547', 'pending_review', true
+  select ${sqlString(r.product_id)}, brand_upsert.id, ${sqlString(r.brand_name)}, ${sqlString(r.product_name)}, ${sqlString(r.normalized_product_name)}, ${sqlString(r.category)}, ${sqlString(r.subcategory)}, ${sqlString(r.description)}, ${sqlString(r.upc)}, ${sqlString(r.sku)}, ${sqlTextArray(r.tag_list)}, array['Imported']::text[], '{}'::text[], '#dcead7', '#416547', 'pending_review', ${r.is_public_ready ? "true" : "false"}
   from brand_upsert
   on conflict (id) do update set
     brand_id = excluded.brand_id,
